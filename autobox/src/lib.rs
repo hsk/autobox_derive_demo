@@ -1,62 +1,136 @@
 use proc_macro::TokenStream as TS;
 use proc_macro2::TokenStream as TS2;
 use quote::{quote, ToTokens};
-use syn::{parse_macro_input, DeriveInput};
+use syn::{parse_macro_input,parse_quote,parse_str,Error,DeriveInput,Type};
+use syn::visit_mut::{VisitMut,visit_type_mut};
+use darling::{FromDeriveInput};
 
-#[proc_macro_derive(AutoBox)]
+#[proc_macro_derive(AutoBox,attributes(autobox))]
 pub fn autobox_derive(input: TS) -> TS {
-    let input = &parse_macro_input!(input as DeriveInput);
+    let input:&DeriveInput = &parse_macro_input!(input);
     match gen(input) {
         Ok(generated) => generated,
         Err(err) => err.to_compile_error().into(),
     }
 }
 
-fn checkbox(s:&str)->Option<String> {
-    let re = regex::Regex::new(r"^Box < (.+) >$").unwrap();
-    match re.captures(s) {
-        Some(cap) => Some(cap[1].to_string()),
-        None => None,
-    }
+#[derive(Debug, FromDeriveInput)]
+#[darling(attributes(autobox))]
+struct AutoBoxOption {
+    #[darling(default)]
+    uppercase: bool,
 }
-fn cnv_input(s:String)->String {
-    if s == "String" {
-        "&str".to_string()
-    } else if let Some(ty) = checkbox(s.as_str()) {
-        cnv_input(ty)
-    } else {
-        s
-    }
-}
-fn cnv_input2(s:String)->String {
-    if let Some(ty) = checkbox(s.as_str()) {
-        cnv_input2(ty)
-    } else {
-        s
-    }
-}
-fn cnv_output(v:String,s:String)->String {
-    if s == "String" {
-        format!("{}.to_string()",v)
-    } else if let Some(ty) = checkbox(s.as_str()) {
-        format!("Box::new({})",cnv_output(v,ty))
-    } else {
-        v
+
+fn get_option(item:& DeriveInput) -> bool {
+    match AutoBoxOption::from_derive_input(item) {
+        Ok(option) => option.uppercase,
+        Err(_) => false,
     }
 }
 
-fn gen(derive_input: &DeriveInput) -> Result<TS, syn::Error> {
+fn checkbox0(ty:Type)->Result<String,()> {
+    let syn::Type::Path(syn::TypePath{path:syn::Path{segments,..},..})=ty else { return Err(()) };
+    let syn::PathSegment{ident,
+            arguments: syn::PathArguments::AngleBracketed(
+                syn::AngleBracketedGenericArguments {args,..})}
+                = &segments[0] else { return Err(()) };
+    if ident.to_string().as_str() != "Box" { return Err(()) }
+    let str = args[0].to_token_stream().to_string();
+    Ok(str)
+}
+fn checkbox1(ty:Type)->Result<Type,()> {
+    let s = checkbox0(ty)?;
+    Ok(parse_str(s.as_str()).unwrap())
+}
+
+fn checkbox(s:&str)->Result<String,()> {
+    let Ok(s) = parse_str(s) else { return Err(()) };
+    checkbox0(s)
+}
+
+#[derive(Debug)]
+struct CnvInput {
+    sup:String
+}
+
+impl VisitMut for CnvInput {
+    fn visit_type_mut(&mut self, node: &mut Type) {
+        visit_type_mut(self,node);
+        let s = node.to_token_stream().to_string();
+        if s == "String" {
+            *node = parse_quote!{&str};
+        } else
+        if s == self.sup {
+            *node = parse_quote!{super:: #node};
+        } else
+        if let Ok(ty) = checkbox1(node.clone()) {
+            *node = ty;
+        }
+    }
+}
+
+fn cnv_input(sup: String, ty: Type)->String {
+    let mut ty = ty;
+    CnvInput{sup}.visit_type_mut(&mut ty);
+    ty.to_token_stream().to_string()
+}
+
+fn cnv_input2(s:String)->String {
+    let Ok(ty) = checkbox(s.as_str()) else { return s };
+    ty
+}
+
+/*
+#[derive(Debug)]
+struct CnvOutput {
+    sup:String
+}
+
+impl VisitMut for CnvOutput {
+    fn visit_type_mut(&mut self, node: &mut Type) {
+        visit_type_mut(self,node);
+        let s = node.to_token_stream().to_string();
+        if s == "String" {
+            *node = parse_quote!{&str};
+        } else
+        if s == self.sup {
+            *node = parse_quote!{super:: #node};
+        } else
+        if let Ok(ty) = checkbox1(node.clone()) {
+            *node = ty;
+        }
+    }
+}
+
+fn cnv_output1(sup: String, ty: Type)->String {
+    let mut ty = ty;
+    CnvOutput{sup}.visit_type_mut(&mut ty);
+    ty.to_token_stream().to_string()
+}
+*/
+fn cnv_output(v:String,ty:String)->String {
+    if ty == "String" { return format!("{}.to_string()",v) } 
+    if let Ok(ty) = checkbox(ty.as_str()) {
+        return format!("Box::new({})",cnv_output(v,ty))
+    }
+    v
+}
+
+fn gen(derive_input: &DeriveInput) -> Result<TS, Error> {
     match &derive_input.data {
         syn::Data::Struct(v) => gen_struct(derive_input,v),
         syn::Data::Enum(v) => gen_enum(derive_input,v),
-        e => Err(syn::Error::new_spanned(
+        e => Err(Error::new_spanned(
                 &derive_input.ident,
                 format!("Must be struct type {:?}",e),
             )),
     }
 }
 
-fn gen_fun_name(text:String)->String {
+fn gen_fun_name(derive_input: &DeriveInput, text:String)->String {
+    if get_option(derive_input) {
+        return text
+    }
     if text.len() == 1 {
         text.to_lowercase()
     } else {
@@ -67,24 +141,24 @@ fn gen_fun_name(text:String)->String {
     }
 }
 
-fn gen_struct(derive_input: &DeriveInput, struct_data:&syn::DataStruct)-> Result<TS, syn::Error> {
+fn gen_struct(derive_input: &DeriveInput, struct_data:&syn::DataStruct)-> Result<TS, Error> {
     let mut args = Vec::new();
     let mut ps = Vec::new();
     let mut un = false;
+    let name = &derive_input.ident;
     for (i,field) in struct_data.fields.iter().enumerate() {
         let ty = field.ty.to_token_stream().to_string();
-        let ty1:TS2 = cnv_input(ty.clone()).parse().unwrap();
-        let id = match &field.ident.as_ref() {
+        let ty1:TS2 = cnv_input(name.to_string(),field.ty.clone()).parse().unwrap();
+        let id = match &field.ident {
             Some(v) => v.to_string(),
             None => {un=true;format!("v{}",i)},
         };
-        let v:TS2 = cnv_output(id.clone(),ty).parse().unwrap();
+        let v:TS2 = cnv_output(id.clone(),ty.clone()).parse().unwrap();
         let id:TS2 = id.parse().unwrap();
         args.push(quote!{#id : #ty1});
         ps.push(if un {quote!{#v}} else {quote!{#id: #v}})
     }
-    let name = &derive_input.ident;
-    let fun_name:TS2 = gen_fun_name(name.to_string()).parse().unwrap();
+    let fun_name:TS2 = gen_fun_name(derive_input,name.to_string()).parse().unwrap();
     let mod_name:TS2 = name.to_string().to_lowercase().parse().unwrap();
     let gen = if ps.len() == 0 {
         quote! {
@@ -97,13 +171,13 @@ fn gen_struct(derive_input: &DeriveInput, struct_data:&syn::DataStruct)-> Result
         let ps = if un {quote!{(#(#ps,)*)}} else {quote!{{#(#ps,)*}}};
         quote! {
             mod #mod_name {
-                use super:: #name;
-                pub fn #fun_name (#(#args,)*) -> #name {
-                    #name #ps
+                pub fn #fun_name (#(#args,)*) -> super::#name {
+                    super::#name #ps
                 }
             }
         }
     };
+    println!("{}",gen);
     Ok(gen.into())
 }
 fn doc(attrs:&Vec<syn::Attribute>) -> String {
@@ -119,13 +193,13 @@ fn doc(attrs:&Vec<syn::Attribute>) -> String {
     }
 }
 
-fn gen_enum(derive_input: &DeriveInput, data:&syn::DataEnum)-> Result<TS, syn::Error> {
+fn gen_enum(derive_input: &DeriveInput, data:&syn::DataEnum)-> Result<TS, Error> {
     let variants = data.variants.iter();
     let name = &derive_input.ident;
     let mut bnfs = vec![];
     let funs = variants.map(|v:&syn::Variant| {
         let vid = &v.ident;
-        let fun_name:TS2 = gen_fun_name(vid.to_string()).parse().unwrap();
+        let fun_name:TS2 = gen_fun_name(derive_input, vid.to_string()).parse().unwrap();
         let mut args = Vec::new();
         let mut params = Vec::new();
         let mut params2 = Vec::new();
@@ -137,8 +211,8 @@ fn gen_enum(derive_input: &DeriveInput, data:&syn::DataEnum)-> Result<TS, syn::E
             }.parse().unwrap();
             let ty = field.ty.to_token_stream().to_string();
             let v:TS2 = cnv_output(id.to_string(),ty.clone()).parse().unwrap();
-            let ty2:TS2 = cnv_input2(ty.clone()).parse().unwrap();
-            let ty:TS2 = cnv_input(ty).parse().unwrap();
+            let ty2:TS2 = cnv_input2(ty).parse().unwrap();
+            let ty:TS2 = cnv_input(name.to_string(), field.ty.clone()).parse().unwrap();
             args.push(quote!{#id : #ty});
             params.push(if un {quote!{#v}} else {quote!{#id:#v}});
             params2.push(if un {quote!{#ty2}} else {quote!{#id:#ty2}});
@@ -168,7 +242,7 @@ fn gen_enum(derive_input: &DeriveInput, data:&syn::DataEnum)-> Result<TS, syn::E
             #(#funs)*
         }
     };
-    //println!("gen {}",gen);
+    println!("gen {}",gen);
     println!("{:<33}{}",format!("{} ::=",name),doc(&derive_input.attrs));
     for (bnf,com) in bnfs.iter() {
         println!("  {:<30} {}",bnf,com);
