@@ -1,5 +1,6 @@
 use autobox::AutoBox;
 
+#[allow(dead_code)]
 #[derive(AutoBox,Debug)]
 pub struct Sample {
     field1: String,
