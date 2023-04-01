@@ -19,7 +19,9 @@ mod test{
     use e::*;
     #[test]
     fn test() {
-        assert_eq!(r#"Sub { a: Add(Var("a"), Nil), b: Bool(true) }"#,format!("{:?}",sub(add(var("a"),nil),bool(true))));
+        assert_eq!(
+            r#"Sub { a: Add(Var("a"), Nil), b: Bool(true) }"#,
+            format!("{:?}",sub(add(var("a"),nil),bool(true))));
     }
 }
 
