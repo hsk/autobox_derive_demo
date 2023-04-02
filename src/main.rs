@@ -32,4 +32,6 @@ fn main() {
     println!("{:?}",sub(add(var("a"),nil),bool(true)));
     println!("{:?}",sample2("a","b"));
     println!("{:?}",sample3);
+    println!("Syntax\n{}",e::bnflike);
+
 }
